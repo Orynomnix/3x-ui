@@ -323,6 +323,11 @@ func (j *LdapSyncJob) deleteClientsNotInLDAP(inboundTag string, ldapEmails map[s
 
 			for _, c := range batch {
 				nr, err := j.clientService.DetachByEmail(&j.inboundService, ib.Id, c.Email)
+				// Read before the error check: the apply can report an error after
+				// it already committed, and that removal still needs the restart.
+				if nr {
+					restartNeeded = true
+				}
 				if err != nil {
 					logger.Warningf("Failed to delete client %s from inbound id=%d(tag=%s): %v",
 						c.Email, ib.Id, ib.Tag, err)
@@ -330,9 +335,6 @@ func (j *LdapSyncJob) deleteClientsNotInLDAP(inboundTag string, ldapEmails map[s
 				}
 				logger.Infof("Deleted client %s from inbound id=%d(tag=%s)",
 					c.Email, ib.Id, ib.Tag)
-				if nr {
-					restartNeeded = true
-				}
 			}
 		}
 	}

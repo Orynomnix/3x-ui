@@ -297,6 +297,36 @@ func (s *ClientService) fanoutInboundClientAdds(inboundSvc *InboundService, adds
 	return fanoutInboundApplies(applies)
 }
 
+// markInboundNodesDirty makes a half-applied client edit unobservable to a node
+// snapshot merge, which skips a node whose config is already flagged dirty.
+func markInboundNodesDirty(inboundIds []int) error {
+	if len(inboundIds) == 0 {
+		return nil
+	}
+	var nodeIDs []int
+	for _, batch := range chunkInts(inboundIds, sqlInChunk) {
+		var ids []int
+		if err := database.GetDB().Model(&model.Inbound{}).
+			Where("id IN ? AND node_id IS NOT NULL", batch).
+			Distinct().Pluck("node_id", &ids).Error; err != nil {
+			return err
+		}
+		nodeIDs = append(nodeIDs, ids...)
+	}
+	if len(nodeIDs) == 0 {
+		return nil
+	}
+	return runSerializedTx(func(tx *gorm.DB) error {
+		svc := &NodeService{}
+		for _, id := range nodeIDs {
+			if err := svc.MarkNodeDirtyTx(tx, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (s *ClientService) fillProtocolDefaults(c *model.Client, ib *model.Inbound) error {
 	switch ib.Protocol {
 	case model.VMESS, model.VLESS:
@@ -472,6 +502,9 @@ func (s *ClientService) Update(inboundSvc *InboundService, id int, updated model
 	if err != nil {
 		return false, err
 	}
+	// The rename rewrites the one shared client record, so every node holding
+	// this client goes stale — not just the ones an inboundIds filter applies.
+	attachedIds := append([]int(nil), inboundIds...)
 	if len(inboundFilter) > 0 {
 		allow := make(map[int]struct{}, len(inboundFilter))
 		for _, fid := range inboundFilter {
@@ -602,6 +635,11 @@ func (s *ClientService) Update(inboundSvc *InboundService, id int, updated model
 		applies = append(applies, inboundApply{id: ibId, run: func() (bool, error) {
 			return s.UpdateInboundClient(inboundSvc, data, existing.Email)
 		}})
+	}
+	// Each apply marks only its OWN node dirty, so between the first and last
+	// one a merge could resurrect the pre-edit email as a second client (#6050).
+	if err := markInboundNodesDirty(attachedIds); err != nil {
+		return false, err
 	}
 	needRestart, applyErr := fanoutInboundApplies(applies)
 	if applyErr != nil {
